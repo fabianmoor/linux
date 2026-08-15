@@ -17,6 +17,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/soc/apple/rtkit.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -618,12 +619,82 @@ static const struct of_device_id of_match[] = {
 MODULE_DEVICE_TABLE(of, of_match);
 
 #ifdef CONFIG_PM_SLEEP
+static struct apple_dcp *apple_disconnected_dcp(struct apple_crtc *acrtc)
+{
+	struct apple_dcp *dcp;
+
+	if (!acrtc->dcp)
+		return NULL;
+
+	dcp = platform_get_drvdata(acrtc->dcp);
+	if (!dcp || !dcp->rtk || !dcp->connector ||
+	    dcp->connector->connected || dcp->crashed)
+		return NULL;
+
+	return dcp;
+}
+
+static void apple_quiesce_disconnected_dcps(struct device *dev,
+					    struct apple_drm_private *apple)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, &apple->drm) {
+		struct apple_dcp *dcp = apple_disconnected_dcp(to_apple_crtc(crtc));
+		int ret;
+
+		if (!dcp || !apple_rtkit_is_running(dcp->rtk))
+			continue;
+
+		dev_info(dev, "quiescing disconnected DCP %u\n", dcp->index);
+		ret = apple_rtkit_quiesce(dcp->rtk);
+		if (ret)
+			dev_warn(dev, "failed to quiesce DCP %u: %d\n",
+				 dcp->index, ret);
+	}
+}
+
+static void apple_wake_disconnected_dcps(struct device *dev,
+					 struct apple_drm_private *apple)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, &apple->drm) {
+		struct apple_dcp *dcp = apple_disconnected_dcp(to_apple_crtc(crtc));
+		int ret;
+
+		if (!dcp || apple_rtkit_is_running(dcp->rtk))
+			continue;
+
+		dev_info(dev, "waking disconnected DCP %u\n", dcp->index);
+		ret = apple_rtkit_wake(dcp->rtk);
+		if (ret)
+			dev_warn(dev, "failed to wake DCP %u: %d\n",
+				 dcp->index, ret);
+	}
+}
+
 static int apple_platform_suspend(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+	int ret;
 
-	if (apple)
-		return drm_mode_config_helper_suspend(&apple->drm);
+	if (!apple)
+		return 0;
+
+	/*
+	 * drm_mode_config_helper_suspend() returns -EINVAL when a secondary
+	 * DCP (external display) is already disconnected. Do not fail the
+	 * whole PM path; the disconnected coprocessor still generates mailbox
+	 * IRQs that immediately abort s2idle unless it is quiesced.
+	 */
+	ret = drm_mode_config_helper_suspend(&apple->drm);
+	if (ret) {
+		dev_warn(dev,
+			 "drm suspend helper failed: %d, will hotplug on resume\n",
+			 ret);
+		apple_quiesce_disconnected_dcps(dev, apple);
+	}
 
 	return 0;
 }
@@ -632,8 +703,19 @@ static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple)
+	if (!apple)
+		return 0;
+
+	if (apple->drm.mode_config.suspend_state) {
 		drm_mode_config_helper_resume(&apple->drm);
+	} else {
+		/*
+		 * Quiesce reinitializes RTKit. Wake (not boot) is required to
+		 * kick the IOP out of QUIESCED so a later hotplug can attach.
+		 */
+		apple_wake_disconnected_dcps(dev, apple);
+		drm_kms_helper_hotplug_event(&apple->drm);
+	}
 
 	return 0;
 }
