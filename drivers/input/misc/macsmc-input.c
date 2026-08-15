@@ -21,6 +21,7 @@
  * @input: Allocated input_dev; devres managed
  * @nb: Notifier block used for incoming events from SMC (e.g. button pressed down)
  * @wakeup_mode: Set to true when system is suspended and power button events should wake it
+ * @ignore_btn_count: Remaining BTN_TOUCHID events to drop after s2idle entry
  */
 struct macsmc_input {
 	struct device *dev;
@@ -28,6 +29,7 @@ struct macsmc_input {
 	struct input_dev *input;
 	struct notifier_block nb;
 	bool wakeup_mode;
+	int ignore_btn_count;
 };
 
 #define SMC_EV_BTN 0x7201
@@ -44,13 +46,24 @@ static void macsmc_input_event_button(struct macsmc_input *smcin, unsigned long 
 	u8 state = !!(event & 0xff);
 
 	switch (button) {
-	case BTN_POWER:
 	case BTN_TOUCHID:
+		/*
+		 * The SMC fires a spurious BTN_TOUCHID press+release within
+		 * ~1ms of entering s2idle. Drop those so they cannot abort
+		 * suspend via pm_wakeup_dev_event. Real presses after that
+		 * are handled normally.
+		 */
+		if (smcin->wakeup_mode && smcin->ignore_btn_count > 0) {
+			smcin->ignore_btn_count--;
+			return;
+		}
+		fallthrough;
+	case BTN_POWER:
 		pm_wakeup_dev_event(smcin->dev, 0, (smcin->wakeup_mode && state));
 		/*
 		 * Suppress KEY_POWER reports when suspended to avoid powering down
 		 * immediately after waking from s2idle.
-		 * */
+		 */
 		if (smcin->wakeup_mode)
 			return;
 
@@ -180,6 +193,8 @@ static int macsmc_input_pm_prepare(struct device *dev)
 	struct macsmc_input *smcin = dev_get_drvdata(dev);
 
 	smcin->wakeup_mode = true;
+	/* press + release of the spurious TouchID event */
+	smcin->ignore_btn_count = 2;
 	return 0;
 }
 
@@ -188,6 +203,7 @@ static void macsmc_input_pm_complete(struct device *dev)
 	struct macsmc_input *smcin = dev_get_drvdata(dev);
 
 	smcin->wakeup_mode = false;
+	smcin->ignore_btn_count = 0;
 }
 
 static const struct dev_pm_ops macsmc_input_pm_ops = {
